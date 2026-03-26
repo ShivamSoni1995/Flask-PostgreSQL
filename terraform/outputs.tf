@@ -1,5 +1,5 @@
 output "ec2_public_ip" {
-  description = "Public IP of the EC2 instance — access the app at http://<this IP>"
+  description = "Public IP of the EC2 instance"
   value       = aws_instance.app.public_ip
 }
 
@@ -8,9 +8,14 @@ output "ec2_public_dns" {
   value       = aws_instance.app.public_dns
 }
 
+output "app_url" {
+  description = "URL to reach the Flask application"
+  value       = "http://${aws_instance.app.public_ip}"
+}
+
 output "rds_endpoint" {
-  description = "RDS PostgreSQL endpoint (host:port)"
-  value       = "${aws_db_instance.postgres.address}:${aws_db_instance.postgres.port}"
+  description = "RDS PostgreSQL hostname (without port)"
+  value       = aws_db_instance.postgres.address
 }
 
 output "rds_secret_arn" {
@@ -18,12 +23,12 @@ output "rds_secret_arn" {
   value       = aws_secretsmanager_secret.rds_credentials.arn
 }
 
+output "ecr_repository_url" {
+  description = "ECR repository URL — use this to tag and push the Flask image"
+  value       = aws_ecr_repository.flask_app.repository_url
+}
+
 output "ec2_instance_id" {
   description = "EC2 instance ID"
   value       = aws_instance.app.id
-}
-
-output "app_url" {
-  description = "URL to reach the Flask application"
-  value       = "http://${aws_instance.app.public_ip}"
 }

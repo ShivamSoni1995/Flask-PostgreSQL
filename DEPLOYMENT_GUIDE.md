@@ -5,14 +5,31 @@
 
 ## Prerequisites
 
-| Tool | Version | Install |
-|------|---------|---------|
-| Terraform | ≥ 1.10 | https://developer.hashicorp.com/terraform/install |
-| AWS CLI v2 | latest | https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html |
-| Docker + Compose | latest | https://docs.docker.com/engine/install/ |
+| Tool | Version | Notes |
+|------|---------|-------|
+| Terraform | **≥ 1.10** | Required for S3 native state locking |
+| AWS CLI v2 | latest | Must be configured with appropriate permissions |
+| Docker | latest | For building and pushing the Flask image locally |
 
-Ensure `aws configure` is set up with a profile that has permissions to create
-IAM roles, EC2, RDS, VPC, Secrets Manager resources, and S3.
+### Install Terraform 1.10+
+
+```bash
+# Option A — tfenv (recommended, manages multiple versions)
+tfenv install 1.10.0
+tfenv use 1.10.0
+
+# Option B — direct download (Linux)
+wget https://releases.hashicorp.com/terraform/1.10.0/terraform_1.10.0_linux_amd64.zip
+unzip terraform_1.10.0_linux_amd64.zip
+sudo mv terraform /usr/local/bin/
+terraform version   # must show >= 1.10.0
+```
+
+Configure AWS CLI:
+```bash
+aws configure
+# Enter: Access Key ID, Secret Access Key, Region (us-east-1), Output format (json)
+```
 
 ---
 
@@ -21,45 +38,41 @@ IAM roles, EC2, RDS, VPC, Secrets Manager resources, and S3.
 ```
 .
 ├── terraform/
-│   ├── backend.tf       # S3 remote state + provider lock
-│   ├── main.tf          # All AWS resources
+│   ├── backend.tf       # S3 remote state + Terraform version lock
+│   ├── main.tf          # All AWS resources (VPC, EC2, RDS, ECR, IAM, Secrets)
 │   ├── variables.tf     # Input variables
-│   └── outputs.tf       # Key outputs (IP, URL, ARN...)
+│   └── outputs.tf       # Key outputs (IP, URL, ECR URL, RDS endpoint...)
 ├── app/
 │   ├── app.py           # Flask application
 │   ├── requirements.txt
-│   └── Dockerfile       # Multi-stage image
+│   └── Dockerfile       # Multi-stage image (build locally, push to ECR)
 ├── nginx/
 │   └── nginx.conf       # Reverse proxy config
-└── docker-compose.yml   # Orchestration
+└── docker-compose.yml   # Orchestration (used by EC2 user_data)
 ```
 
 ---
 
 ## Step 1 — Bootstrap the S3 Remote State Bucket
 
-> **This step must be completed ONCE before `terraform init`.**
-> The bucket must exist before Terraform can store state in it.
+> **Run ONCE before `terraform init`.** The bucket must exist before Terraform
+> can store state in it.
 
 ```bash
-# Set variables (adjust region as needed)
 export AWS_REGION="us-east-1"
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export TF_STATE_BUCKET="flask-app-tfstate-${ACCOUNT_ID}"
 
 echo "Creating bucket: $TF_STATE_BUCKET"
 
-# 1. Create the bucket
 aws s3api create-bucket \
   --bucket "$TF_STATE_BUCKET" \
   --region "$AWS_REGION"
 
-# 2. Enable versioning (allows state rollback)
 aws s3api put-bucket-versioning \
   --bucket "$TF_STATE_BUCKET" \
   --versioning-configuration Status=Enabled
 
-# 3. Enable default encryption
 aws s3api put-bucket-encryption \
   --bucket "$TF_STATE_BUCKET" \
   --server-side-encryption-configuration '{
@@ -68,179 +81,189 @@ aws s3api put-bucket-encryption \
     }]
   }'
 
-# 4. Block all public access
 aws s3api put-public-access-block \
   --bucket "$TF_STATE_BUCKET" \
   --public-access-block-configuration \
-    "BlockPublicAcls=true,IgnorePublicAcls=true,\
-BlockPublicPolicy=true,RestrictPublicBuckets=true"
+    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
 
 echo "✅ S3 bucket ready: $TF_STATE_BUCKET"
 ```
 
-Now **update `terraform/backend.tf`**:
+Now update `terraform/backend.tf` — replace the bucket value:
 ```hcl
-bucket = "flask-app-tfstate-<YOUR_ACCOUNT_ID>"   # paste real bucket name here
+bucket = "flask-app-tfstate-<YOUR_ACCOUNT_ID>"
 ```
 
 ---
 
-## Step 2 — Create a `terraform.tfvars` File
+## Step 2 — Create an EC2 Key Pair
+
+> Skip this step if you already have an existing key pair in your AWS account.
+
+```bash
+# Create the key pair and save the private key locally
+aws ec2 create-key-pair \
+  --key-name flask-app-key \
+  --region us-east-1 \
+  --query "KeyMaterial" \
+  --output text > ~/.ssh/flask-app-key.pem
+
+# Secure the private key file
+chmod 400 ~/.ssh/flask-app-key.pem
+
+# Verify the key pair exists in AWS
+aws ec2 describe-key-pairs \
+  --key-names flask-app-key \
+  --query "KeyPairs[0].KeyName" \
+  --output text
+```
+
+Use `flask-app-key` as the value for `key_pair_name` in `terraform.tfvars`.
+
+---
+
+## Step 3 — Create `terraform.tfvars`
 
 ```bash
 cd terraform/
+
 cat > terraform.tfvars <<EOF
 aws_region        = "us-east-1"
 project_name      = "flask-app"
-key_pair_name     = "<YOUR_EXISTING_KEY_PAIR_NAME>"   # must already exist in EC2
-db_password       = "<STRONG_RANDOM_PASSWORD>"         # min 8 chars, no @ or /
+key_pair_name     = "flask-app-key"
+db_password       = "$(openssl rand -base64 24 | tr -d '@/+="' | cut -c1-24)"
 EOF
+
+cat terraform.tfvars   # review before continuing
 ```
 
 > **Never commit `terraform.tfvars` to source control** — add it to `.gitignore`.
+> Save the generated password somewhere safe (a password manager).
 
 ---
 
-## Step 3 — Initialise and Plan
+## Step 4 — Initialise and Plan
 
 ```bash
 cd terraform/
 
-# Download providers and configure the S3 backend
 terraform init
-
-# Preview what Terraform will create (~18 resources)
 terraform plan -var-file="terraform.tfvars"
 ```
 
-Expected resource summary (approximate):
-- 1 VPC + 3 subnets + route tables
-- 2 Security Groups
-- 1 Secrets Manager secret + version
-- 1 IAM Role + Policy + Instance Profile
-- 1 RDS DB Subnet Group + 1 DB Instance (PostgreSQL 16)
-- 1 EC2 Instance (Amazon Linux 2023)
+Expected resources (~20):
+- VPC, 3 subnets, route table, internet gateway
+- 2 Security Groups (EC2 + RDS)
+- ECR repository
+- Secrets Manager secret + version
+- IAM Role + Policy + Instance Profile
+- RDS Subnet Group + DB Instance (PostgreSQL 16)
+- EC2 Instance (Amazon Linux 2023)
 
 ---
 
-## Step 4 — Apply the Infrastructure
+## Step 5 — Apply the Infrastructure
 
 ```bash
 terraform apply -var-file="terraform.tfvars"
 ```
 
-Type `yes` when prompted. Total deployment time: **8–15 minutes**
-(RDS provisioning dominates).
+Type `yes` when prompted. Total time: **10–15 minutes** (RDS dominates).
 
-At the end, note the outputs:
-
+Note the outputs at the end:
 ```
-Outputs:
-  app_url        = "http://54.x.x.x"
-  ec2_public_ip  = "54.x.x.x"
-  rds_endpoint   = "flask-app-postgres.xxxxxxxx.us-east-1.rds.amazonaws.com:5432"
-  rds_secret_arn = "arn:aws:secretsmanager:us-east-1:..."
+ecr_repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/flask-app"
+ec2_public_ip      = "54.x.x.x"
+app_url            = "http://54.x.x.x"
+rds_endpoint       = "flask-app-postgres.xxxxxxxx.us-east-1.rds.amazonaws.com"
 ```
 
 ---
 
-## Step 5 — Wait for EC2 Bootstrap
+## Step 6 — Build and Push the Flask Image to ECR
 
-The EC2 `user_data` script installs Docker, fetches secrets, and starts the
-containers. This takes ~3–5 minutes after the instance is in `running` state.
+> **Run on your local machine** (where the `app/` directory is).
+> The EC2 instance pulls the pre-built image — no Docker build happens on EC2.
 
-**Monitor progress:**
 ```bash
+# Get ECR URL from Terraform output
+ECR_URL=$(terraform output -raw ecr_repository_url)
+echo $ECR_URL
+
+# Log Docker into ECR
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin $ECR_URL
+
+# Build the image (from project root)
+docker build -t flask-app ./app
+
+# Tag and push
+docker tag flask-app:latest $ECR_URL:latest
+docker push $ECR_URL:latest
+
+echo "✅ Image pushed to ECR"
+```
+
+---
+
+## Step 7 — Wait for EC2 Bootstrap
+
+The EC2 `user_data` script runs automatically on first boot. It installs Docker,
+fetches secrets, writes config files, pulls the ECR image, and starts Compose.
+This takes **3–5 minutes** after the instance reaches `running` state.
+
+Monitor progress:
+```bash
+EC2_IP=$(terraform output -raw ec2_public_ip)
+
 # SSH into the instance
-ssh -i ~/.ssh/<your-key>.pem ec2-user@<EC2_PUBLIC_IP>
+ssh -i ~/.ssh/flask-app-key.pem ec2-user@$EC2_IP
 
 # Tail the bootstrap log
 sudo tail -f /var/log/user-data.log
-
-# Check Docker containers (run after bootstrap completes)
-docker ps
 ```
 
-Expected `docker ps` output:
-```
-CONTAINER ID   IMAGE               PORTS                NAMES
-xxxxxxxxxxxx   nginx:1.27-alpine   0.0.0.0:80->80/tcp   flask-app-nginx-1
-xxxxxxxxxxxx   flask-app:latest                         flask-app-web-1
+When complete you'll see: `==> Bootstrap complete.`
+
+Check containers are running:
+```bash
+sudo docker ps
+# Should show flask-app-web-1 (healthy) and flask-app-nginx-1 (running)
 ```
 
 ---
 
-## Step 6 — Verify the Application
+## Step 8 — Verify the Application
 
-### 6a. Root endpoint (DB status)
 ```bash
-curl -s http://<EC2_PUBLIC_IP>/ | python3 -m json.tool
+EC2_IP=$(terraform output -raw ec2_public_ip)
+
+# Root endpoint — DB status
+curl -s http://$EC2_IP/ | python3 -m json.tool
+
+# Health check
+curl -s http://$EC2_IP/health
+
+# Verbose DB check
+curl -s http://$EC2_IP/db-check | python3 -m json.tool
 ```
 
-Expected response:
+Expected root response:
 ```json
 {
   "status": "ok",
   "database": {
     "status": "connected",
-    "version": "PostgreSQL 16.x on x86_64-pc-linux-gnu...",
+    "version": "PostgreSQL 16.x ...",
     "error": null
   },
   "request": {
+    "host": "54.x.x.x",
     "method": "GET",
     "path": "/",
-    "remote_addr": "your.ip.here",
-    "host": "54.x.x.x"
+    "remote_addr": "your.ip.here"
   }
 }
-```
-
-### 6b. Health check
-```bash
-curl -s http://<EC2_PUBLIC_IP>/health
-# → {"status": "healthy"}
-```
-
-### 6c. Verbose DB check
-```bash
-curl -s http://<EC2_PUBLIC_IP>/db-check | python3 -m json.tool
-# → {"connected": true, "database": "flaskdb", "user": "flaskadmin", ...}
-```
-
-### 6d. Verify Nginx headers are forwarded
-```bash
-curl -sv http://<EC2_PUBLIC_IP>/ 2>&1 | grep -E "Host|X-Real"
-# Nginx should be passing Host and X-Real-IP headers to Flask
-```
-
----
-
-## Step 7 — Verify Security Configuration
-
-### Confirm RDS is NOT publicly accessible
-```bash
-aws rds describe-db-instances \
-  --db-instance-identifier flask-app-postgres \
-  --query "DBInstances[0].PubliclyAccessible"
-# → false
-```
-
-### Confirm IAM policy is least-privilege
-```bash
-aws iam get-policy-version \
-  --policy-arn $(terraform output -raw rds_secret_arn | \
-    sed 's|secret:.*|policy/flask-app-ec2-secrets-policy|') \
-  --version-id v1
-```
-The policy should show `secretsmanager:GetSecretValue` scoped to a single ARN.
-
-### Confirm secret is accessible from EC2 (SSH in first)
-```bash
-aws secretsmanager get-secret-value \
-  --secret-id flask-app/rds/credentials \
-  --region us-east-1 \
-  --query SecretString \
-  --output text
 ```
 
 ---
@@ -250,10 +273,37 @@ aws secretsmanager get-secret-value \
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
 | `curl` times out | Bootstrap still running | Wait 5 min, check `user-data.log` |
-| `502 Bad Gateway` | Flask container not healthy | `docker logs flask-app-web-1` |
-| `503` on `/` | RDS unreachable | Check RDS SG allows EC2 SG on 5432 |
-| Docker not found | `dnf` install failed | Check `user-data.log` for errors |
-| Secret not found | IAM role not attached | Verify instance profile in EC2 console |
+| `502 Bad Gateway` | Flask container unhealthy | `sudo docker logs flask-app-web-1` |
+| `503` on `/` | RDS unreachable | Check RDS SG allows EC2 SG on port 5432 |
+| ECR pull fails | IAM policy not applied yet | Re-run `terraform apply`, check instance profile |
+| Image not found in ECR | Step 6 skipped | Build and push the image first, then restart compose |
+
+If containers need to be restarted manually after fixing an issue:
+```bash
+cd /opt/flask-app
+sudo docker compose down
+sudo docker compose up -d
+```
+
+---
+
+## Updating the Application
+
+After making changes to `app.py`:
+```bash
+# Rebuild and push from local machine
+docker build -t flask-app ./app
+docker tag flask-app:latest $ECR_URL:latest
+docker push $ECR_URL:latest
+
+# On EC2 — pull new image and restart
+ssh -i ~/.ssh/flask-app-key.pem ec2-user@$EC2_IP
+aws ecr get-login-password --region us-east-1 | \
+  sudo docker login --username AWS --password-stdin $ECR_URL
+cd /opt/flask-app
+sudo docker compose pull web
+sudo docker compose up -d
+```
 
 ---
 
@@ -264,23 +314,21 @@ cd terraform/
 terraform destroy -var-file="terraform.tfvars"
 ```
 
-> Note: The Secrets Manager secret has a 7-day recovery window before permanent deletion.
-> To delete immediately:
-> ```bash
-> aws secretsmanager delete-secret \
->   --secret-id flask-app/rds/credentials \
->   --force-delete-without-recovery
-> ```
+The Secrets Manager secret has a 7-day recovery window. To delete immediately:
+```bash
+aws secretsmanager delete-secret \
+  --secret-id flask-app/rds/credentials \
+  --force-delete-without-recovery
+```
 
-The S3 state bucket is **not** managed by Terraform (by design) and must be
-deleted manually if desired:
+The S3 state bucket is not managed by Terraform and must be deleted manually:
 ```bash
 aws s3 rb s3://$TF_STATE_BUCKET --force
 ```
 
 ---
 
-## Architecture Diagram (Text)
+## Architecture
 
 ```
 Internet
@@ -291,22 +339,25 @@ Internet
 │                                             │
 │  ┌──────────────────────────────────┐       │
 │  │  EC2 (Amazon Linux 2023)         │       │
-│  │  ┌────────┐    ┌──────────────┐  │       │
-│  │  │ Nginx  │───▶│ Flask/Gunicorn│  │       │
-│  │  │  :80   │    │    :5000      │  │       │
-│  │  └────────┘    └──────────────┘  │       │
+│  │  ┌─────────┐   ┌─────────────┐  │       │
+│  │  │  Nginx  │──▶│    Flask    │  │       │
+│  │  │  :80    │   │ (Gunicorn)  │  │       │
+│  │  └─────────┘   │   :5000     │  │       │
+│  │                └─────────────┘  │       │
 │  └──────────────────────────────────┘       │
 └──────────────────────────┬──────────────────┘
                            │ port 5432
 ┌──────────────────────────▼──────────────────┐
-│  Private Subnets (10.0.10.0/24, /11.0/24)   │
-│                                             │
-│  ┌──────────────────────────────────┐       │
-│  │  RDS PostgreSQL 16               │       │
-│  │  (encrypted, not public)         │       │
-│  └──────────────────────────────────┘       │
+│  Private Subnets (10.0.10/24, 10.0.11/24)   │
+│  ┌──────────────────────────────────┐        │
+│  │  RDS PostgreSQL 16               │        │
+│  │  (encrypted, not public)         │        │
+│  └──────────────────────────────────┘        │
 └─────────────────────────────────────────────┘
 
-AWS Secrets Manager ◀── EC2 IAM Role (least-privilege)
-S3 (tfstate bucket) ◀── Terraform backend
+ECR ◀────────── Local machine (docker build + push)
+ECR ──────────▶ EC2 (docker pull on boot)
+Secrets Manager ◀── Terraform (writes credentials)
+Secrets Manager ──▶ EC2 IAM Role (reads on boot)
+S3 ◀──────────────▶ Terraform remote state
 ```

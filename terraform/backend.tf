@@ -4,8 +4,9 @@
 # The S3 bucket for remote state must exist before Terraform can use it.
 # Run the following AWS CLI commands to create it:
 #
-#   export TF_STATE_BUCKET="my-flask-app-tfstate-$(aws sts get-caller-identity --query Account --output text)"
 #   export AWS_REGION="us-east-1"
+#   export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+#   export TF_STATE_BUCKET="flask-app-tfstate-${ACCOUNT_ID}"
 #
 #   aws s3api create-bucket \
 #     --bucket $TF_STATE_BUCKET \
@@ -36,12 +37,12 @@
 terraform {
   backend "s3" {
     # Replace with the bucket name you created above
-    bucket  = "my-flask-app-tfstate-<YOUR_ACCOUNT_ID>"
+    bucket  = "flask-app-tfstate-<YOUR_ACCOUNT_ID>"
     key     = "flask-app/terraform.tfstate"
     region  = "us-east-1"
     encrypt = true
 
-    # S3 native state locking (no DynamoDB required — available since Terraform 1.10)
+    # S3 native state locking — requires Terraform >= 1.10, no DynamoDB needed
     use_lockfile = true
   }
 
@@ -52,5 +53,8 @@ terraform {
     }
   }
 
+  # Must be 1.10+ for S3 native locking (use_lockfile)
+  # Install via: https://developer.hashicorp.com/terraform/install
+  # Or via tfenv: tfenv install 1.10.0 && tfenv use 1.10.0
   required_version = ">= 1.10.0"
 }

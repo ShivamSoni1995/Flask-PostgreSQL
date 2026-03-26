@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 from flask import Flask, jsonify, request
 import psycopg2

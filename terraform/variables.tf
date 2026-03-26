@@ -68,3 +68,9 @@ variable "db_instance_class" {
   type        = string
   default     = "db.t3.micro"
 }
+
+variable "ecr_repository_name" {
+  description = "Name of the ECR repository for the Flask app image"
+  type        = string
+  default     = "flask-app"
+}
